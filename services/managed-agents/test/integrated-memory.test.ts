@@ -452,6 +452,73 @@ describe("memory through the edge, the real host and the real Memory DO", () => 
     ]);
   });
 
+  it("closes the OpenCode runtime once the session object is idle, builds a fresh one for the next turn, and keeps it while a turn is owed", async () => {
+    // The runtime's background fibers re-arm timers for as long as it lives,
+    // and a timer outlives the Durable Object that created it: unclosed, one
+    // whole runtime stayed in the isolate for every session that ever ran
+    // (measured: about 16 MB of heap a session, never returned). The count
+    // asserted here is of live runtimes, not of bytes.
+    const f = await fixture("Runtime closed when idle");
+    const response = await SELF.fetch(
+      f.documentUrl("development"),
+      jsonRequest("PUT", { title: "Workshop", text: "dev text" }, { "if-none-match": "*" }),
+    );
+    expect(response.status).toBe(201);
+    const session = await f.createSession();
+    type Runtime = {
+      opencode?: Promise<{ close(): Promise<void> }>;
+      handlersInFlight: number;
+      turnStreamsOpen: number;
+      getOpenCode(): Promise<unknown>;
+      releaseOpenCodeWhenIdle(): void;
+      ctx: DurableObjectState;
+    };
+    const runtimeSessionId = await runInDurableObject(
+      env.SESSIONS.getByName(session.id),
+      (_instance: SessionDurableObject, state) =>
+        state.storage.sql
+          .exec<{ runtime_session_id: string }>("SELECT runtime_session_id FROM workerd_session")
+          .one().runtime_session_id,
+    );
+    expect(runtimeSessionId).not.toBe("");
+    const inRuntime = <T>(body: (runtime: Runtime) => T | Promise<T>): Promise<T> =>
+      runInDurableObject(
+        env.OPENCODE_SESSIONS.get(env.OPENCODE_SESSIONS.idFromName(runtimeSessionId)),
+        (instance) => body(instance as unknown as Runtime),
+      );
+    const closed = () =>
+      inRuntime(
+        (runtime) =>
+          runtime.opencode === undefined && runtime.handlersInFlight === 0 && runtime.turnStreamsOpen === 0,
+      );
+
+    const first = await f.turn(session.id, "nomemory: first", "turn-idle-1");
+    expect(rendered(first.events)).toHaveLength(1);
+    await until(closed);
+
+    // The next turn builds a fresh runtime from the object's storage and
+    // completes like the first; the runtime is closed again afterwards.
+    const second = await f.turn(session.id, "nomemory: second", "turn-idle-2");
+    expect(rendered(second.events)).toHaveLength(1);
+    expect(second.turnId).not.toBe(first.turnId);
+    await until(closed);
+
+    // A held turn lease means an execution may be running in the runtime
+    // with no stream attached, or is owed a replay: the runtime is kept.
+    await inRuntime(async (runtime) => {
+      runtime.ctx.storage.sql.exec(
+        "INSERT INTO workerd_turn_lease (opencode_session_id, turn_id, claimed_at) VALUES ('held-session', 'held-turn', ?)",
+        Date.now(),
+      );
+      await runtime.getOpenCode();
+      runtime.releaseOpenCodeWhenIdle();
+      expect(runtime.opencode).toBeDefined();
+      runtime.ctx.storage.sql.exec("DELETE FROM workerd_turn_lease WHERE opencode_session_id = 'held-session'");
+      runtime.releaseOpenCodeWhenIdle();
+      expect(runtime.opencode).toBeUndefined();
+    });
+  });
+
   it("recalls, saves, reports memory.saved, survives a crash mid-closure and hands the notes to the next session", async () => {
     const f = await fixture("Integrated memory");
     for (const [environment, text] of [["development", "dev text"], ["production", "prod text"]] as const) {

@@ -688,6 +688,13 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
   private pendingModelRoute?: RuntimeModelRoute;
   private pendingSandboxContext?: NonNullable<TurnInput["sandboxContext"]>;
   private opencode?: Promise<OpenCodeWorkerd.Interface>;
+  /**
+   * What is using this activation's OpenCode runtime right now: requests and
+   * alarms being handled, and turn streams still open. The runtime is closed
+   * when both are zero and no execution is owed (`releaseOpenCodeWhenIdle`).
+   */
+  private handlersInFlight = 0;
+  private turnStreamsOpen = 0;
   /** Expensive MCP catalog diagnostics run once per Durable Object activation. */
   private mcpExposureLogged = false;
   private projection?: Promise<ArtifactProjection>;
@@ -1017,6 +1024,62 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
           "SELECT activation FROM workerd_activation WHERE slot = 1",
         )
         .one().activation,
+    );
+  }
+
+  /**
+   * Close this activation's OpenCode runtime once nothing uses it.
+   *
+   * The runtime is an Effect `ManagedRuntime` whose background fibers re-arm
+   * timers for as long as it lives. Those timers are roots of their own: when
+   * the Durable Object is evicted the object goes, the runtime does not, and
+   * its timers then fire outside any request ("Disallowed operation called
+   * within global scope"). Measured on a local stack (twenty sessions, each
+   * run to its end, 150 s idle before each reading): the isolate's heap grew
+   * by about 16 MB a session and was never returned, with about 185 fibers
+   * and 29 pending timers left behind per ended session, while the session
+   * objects themselves had been evicted. Nothing called `close()`.
+   *
+   * Closing here does to the runtime what eviction already does to the
+   * object, at a moment the object chooses: no handler is running, no turn
+   * stream is open, the turn counter is zero and no turn lease is held. A
+   * held lease means an execution may still be running inside the runtime
+   * with no stream attached, or is owed a replay by the next boot's sweep;
+   * the runtime is left alone then. The next request builds a fresh runtime
+   * from the object's storage, exactly as it does after an eviction.
+   */
+  private releaseOpenCodeWhenIdle(): void {
+    const running = this.opencode;
+    if (!running || this.handlersInFlight !== 0 || this.turnStreamsOpen !== 0) return;
+    try {
+      if (this.hasPlatformSchema()) {
+        const turns = this.ctx.storage.sql
+          .exec<{ active_turns: number }>("SELECT active_turns FROM workerd_turn_state WHERE slot = 1")
+          .toArray()[0];
+        if (turns && Number(turns.active_turns) !== 0) return;
+        const leases = this.ctx.storage.sql
+          .exec<{ held: number }>("SELECT COUNT(*) AS held FROM workerd_turn_lease")
+          .one();
+        if (Number(leases.held) !== 0) return;
+      }
+    } catch {
+      // The state could not be read: keep the runtime rather than close one
+      // that may be executing.
+      return;
+    }
+    this.opencode = undefined;
+    this.ctx.waitUntil(
+      running
+        .then((opencode) => opencode.close())
+        .catch((error) => {
+          console.error(
+            JSON.stringify({
+              level: "error",
+              event: "workerd.opencode_close_failed",
+              message: message(error),
+            }),
+          );
+        }),
     );
   }
 
@@ -1652,6 +1715,7 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
     // its stream.
     let traced: Latency | undefined;
     let streaming = false;
+    this.handlersInFlight += 1;
     try {
       const url = new URL(request.url);
       await this.initialized;
@@ -1916,6 +1980,8 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
       return json({ error: errorMessage }, 500);
     } finally {
       if (!streaming) traced?.send(this.ctx);
+      this.handlersInFlight -= 1;
+      this.releaseOpenCodeWhenIdle();
     }
   }
 
@@ -2363,6 +2429,9 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
       Symbol.asyncIterator
     ]();
     const host = this;
+    // Open until the stream's own `finally` has run: the runtime is not
+    // closed under a turn that is still being forwarded.
+    host.turnStreamsOpen += 1;
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -2427,7 +2496,12 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
         } finally {
           abort.abort();
           trace?.latency.send(host.ctx);
-          await host.finishTurn();
+          try {
+            await host.finishTurn();
+          } finally {
+            host.turnStreamsOpen -= 1;
+            host.releaseOpenCodeWhenIdle();
+          }
           controller.close();
         }
       },
@@ -4513,6 +4587,16 @@ export class OpenCodeSessionDurableObject extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    this.handlersInFlight += 1;
+    try {
+      await this.alarmWork();
+    } finally {
+      this.handlersInFlight -= 1;
+      this.releaseOpenCodeWhenIdle();
+    }
+  }
+
+  private async alarmWork(): Promise<void> {
     // The alarm's lease work takes the acquisition slot like a command
     // does, so idle disposal never races a decision that just reused or
     // replaced the computer.
